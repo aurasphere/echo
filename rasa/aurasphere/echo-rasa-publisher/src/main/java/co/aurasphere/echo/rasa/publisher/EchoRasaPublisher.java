@@ -1,5 +1,7 @@
 package co.aurasphere.echo.rasa.publisher;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
@@ -14,7 +16,9 @@ import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import com.google.common.base.Charsets;
 import com.google.common.collect.Sets;
+import com.google.common.io.ByteSource;
 import com.google.gson.Gson;
 
 import co.aurasphere.echo.rasa.publisher.model.indie.Indie;
@@ -62,21 +66,20 @@ public class EchoRasaPublisher {
      */
     private static Set<String> informIntents = new HashSet<>();
 
+    /**
+     * Custom actions for mappning duckling slots. Populated during Stories, used during domain.
+     */
+    private static Set<String> ducklingSlotsMappingActions = new HashSet<>();
+
     // Native entity types.
     static {
-        sampleParameterMap.put("@sys.number", "1");
-        sampleParameterMap.put("@sys.email", "abc@gmail.com");
-        sampleParameterMap.put("@sys.geo-city", "San Francisco");
-        sampleParameterMap.put("@sys.person", "John Smith");
-        sampleParameterMap.put("@sys.date-time", "from May 1 2019");
+        sampleParameterMap.put("@sys.number", "over $100");
         sampleParameterMap.put("@sys.geo-state", "California");
+        sampleParameterMap.put("@sys.date-time", "from May 1 2019");
 
-        nativeParameterMap.put("@sys.number", "float");
-        nativeParameterMap.put("@sys.email", "text");
-        nativeParameterMap.put("@sys.geo-city", "text");
+        nativeParameterMap.put("@sys.number", "text");
         nativeParameterMap.put("@sys.geo-state", "text");
-        nativeParameterMap.put("@sys.person", "text");
-        nativeParameterMap.put("@sys.date-time", "text");
+        nativeParameterMap.put("@sys.date-time", "unfeaturized");
     }
 
     public static void main(String[] args) throws Exception {
@@ -96,6 +99,9 @@ public class EchoRasaPublisher {
         parser.addArgument("-r", "--rasa-server-address")
             .setDefault("http://localhost:5005")
             .help("Address of the Rasa bot server for training.");
+        parser.addArgument("-d", "--duckling-server-address")
+            .setDefault("http://localhost:8000")
+            .help("Address of the Duckling server for entity recognition.");
         Namespace ns = null;
         try {
             ns = parser.parseArgs(args);
@@ -122,11 +128,29 @@ public class EchoRasaPublisher {
         // Convert indie file to Rasa files.
         Map<String, Map<String, String>> endpoints = createEndpoints(ns.getString("action_server_endpoint"));
         Map<String, NluData> nlu = createNlu(parsedIndie);
-        Map<String, Object> domain = createDomain(parsedIndie);
         String stories = createStories(parsedIndie);
+        Map<String, Object> domain = createDomain(parsedIndie);
+        String config = createConfig(ns.getString("duckling_server_address"));
 
         // Publish to bot.
-        publishStrategy.publish(endpoints, nlu, domain, stories);
+        publishStrategy.publish(endpoints, nlu, domain, stories, config);
+    }
+
+    private static String createConfig(String ducklingServerAddress) throws IOException {
+        InputStream configFile = EchoRasaPublisher.class
+            .getClassLoader()
+            .getResourceAsStream("config-template.yml");
+        ByteSource byteSource = new ByteSource() {
+            @Override
+            public InputStream openStream() throws IOException {
+                return configFile;
+            }
+        };
+        String configFileContent = byteSource.asCharSource(Charsets.UTF_8)
+            .read();
+        
+        // Fills in the address into the template.
+        return configFileContent.replace("${duckling_server_address}", ducklingServerAddress);
     }
 
     // DATA
@@ -135,75 +159,6 @@ public class EchoRasaPublisher {
         Map<String, String> actionEndpoint = Collections.singletonMap("url", endpoint);
         Map<String, Map<String, String>> yamlContent = Collections.singletonMap("action_endpoint", actionEndpoint);
         return yamlContent;
-    }
-
-    private static String createStories(Indie parsedIndie) {
-        StringBuilder fileContent = new StringBuilder();
-        List<Intent> intents = parsedIndie.getIntents();
-        Gson gson = new Gson();
-        for (Intent intent : intents) {
-            Set<Parameter> mandatoryParameters = intent.getParameters()
-                .stream()
-                .filter(Parameter::getMandatory)
-                .collect(Collectors.toSet());
-            Set<Set<Parameter>> powerSet = Sets.powerSet(mandatoryParameters);
-
-            // We build a story for each mandatory parameters combination.
-            for (Set<Parameter> availableParametersSet : powerSet) {
-                // Missing parameters.
-                Set<Parameter> missingParameters = Sets.difference(mandatoryParameters, availableParametersSet);
-
-                // Input parameters.
-                Function<Parameter, String> inputMappingFunction = p -> {
-                    String parameterEntityType = p.getEntityType();
-                    String parameterId = p.getId();
-                    String parameterSample = sampleParameterMap.get(parameterId);
-                    if (parameterSample == null) {
-                        return sampleParameterMap.get(parameterEntityType);
-                    }
-                    return parameterSample;
-                };
-                Map<String, String> inputParametersMap = availableParametersSet.stream()
-                    .collect(Collectors.toMap(Parameter::getId, inputMappingFunction));
-                String inputParametersJson = gson.toJson(inputParametersMap);
-
-                // Story name.
-                fileContent.append("## ")
-                    .append(intent.getId())
-                    .append(" with input params ")
-                    .append(inputParametersJson)
-                    .append("\n");
-
-                // Starting intent.
-                fileContent.append("* ")
-                    .append(intent.getId());
-                if (!availableParametersSet.isEmpty()) {
-                    fileContent.append(inputParametersJson);
-                }
-                fileContent.append("\n");
-
-                // Fills missing slots.
-                for (Parameter parameter : missingParameters) {
-                    // Sample parameter.
-                    String parameterId = parameter.getId();
-                    Map<String, String> sampleInputMap = Collections.singletonMap(parameterId, inputMappingFunction.apply(parameter));
-                    fileContent.append("\t- utter_ask_")
-                        .append(intent.getId())
-                        .append("_")
-                        .append(parameterId)
-                        .append("\n");
-                    fileContent.append("* inform_")
-                        .append(intent.getId())
-                        .append(gson.toJson(sampleInputMap))
-                        .append("\n");
-                }
-                // All slots filled, send to server.
-                fileContent.append("\t- action_send_server_")
-                    .append(intent.getId())
-                    .append("\n\n");
-            }
-        }
-        return fileContent.toString();
     }
 
     private static Map<String, NluData> createNlu(Indie parsedIndie) {
@@ -264,6 +219,114 @@ public class EchoRasaPublisher {
         return Collections.singletonMap("rasa_nlu_data", nluContent);
     }
 
+    private static String createStories(Indie parsedIndie) {
+        StringBuilder fileContent = new StringBuilder();
+        List<Intent> intents = parsedIndie.getIntents();
+        Gson gson = new Gson();
+        for (Intent intent : intents) {
+            Set<Parameter> mandatoryParameters = intent.getParameters()
+                .stream()
+                .filter(Parameter::getMandatory)
+                .collect(Collectors.toSet());
+
+            // Needed to add custom mapping for duckling
+            Set<Parameter> ducklingParameters = intent.getParameters()
+                .stream()
+                .filter(p -> p.getEntityType()
+                    .equals("@sys.date-time"))
+                .collect(Collectors.toSet());
+
+            Set<Parameter> totalParameters = Sets.union(mandatoryParameters, ducklingParameters);
+            Set<Set<Parameter>> totalParametersPowerSet = Sets.powerSet(totalParameters);
+
+            // We build a story for each mandatory parameters combination.
+            for (Set<Parameter> availableParametersSet : totalParametersPowerSet) {
+                // Missing parameters.
+                Set<Parameter> missingParameters = Sets.difference(mandatoryParameters, availableParametersSet);
+
+                // Maps input parameters to samples.
+                Function<Parameter, String> sampleParametersMappingFunction = p -> {
+                    String parameterEntityType = p.getEntityType();
+                    String parameterId = p.getId();
+                    String parameterSample = sampleParameterMap.get(parameterId);
+
+                    // If it's a duckling type, return accordingly. At the moment only date is handled.
+                    if (ducklingParameters.contains(p)) {
+                        return "2020-07-01T00:00:00.000+02:00";
+                    }
+
+                    // If no sample was returned it means it's a custom type. Lookup by type.
+                    if (parameterSample == null) {
+                        return sampleParameterMap.get(parameterEntityType);
+                    }
+                    return parameterSample;
+                };
+
+                Function<Parameter, String> idParametersMappingFunctions = p -> {
+                    // Handles duckling parameters. For now only date is supported.
+                    if (ducklingParameters.contains(p)) {
+                        return "time";
+                    }
+                    return p.getId();
+                };
+
+                // Gets a sample for each parameter.
+                Map<String, String> inputSampleParametersMap = availableParametersSet.stream()
+                    .collect(Collectors.toMap(idParametersMappingFunctions, sampleParametersMappingFunction));
+
+                // Story input.
+                String inputParametersJson = gson.toJson(inputSampleParametersMap);
+
+                // Story name.
+                fileContent.append("## ")
+                    .append(intent.getId())
+                    .append(" with input params ")
+                    .append(inputParametersJson)
+                    .append("\n");
+
+                // Starting intent.
+                fileContent.append("* ")
+                    .append(intent.getId());
+                if (!availableParametersSet.isEmpty()) {
+                    fileContent.append(inputParametersJson);
+                }
+                fileContent.append("\n");
+
+                // Fills missing slots.
+                for (Parameter parameter : missingParameters) {
+                    // Sample parameter.
+                    String parameterId = parameter.getId();
+                    Map<String, String> sampleInputMap = Collections.singletonMap(parameterId, sampleParametersMappingFunction.apply(parameter));
+                    fileContent.append("\t- utter_ask_")
+                        .append(intent.getId())
+                        .append("_")
+                        .append(parameterId)
+                        .append("\n");
+                    fileContent.append("* inform_")
+                        .append(intent.getId())
+                        .append(gson.toJson(sampleInputMap))
+                        .append("\n");
+                }
+
+                // If we're using some duckling parameters, add the custom mappings.
+                Set<Parameter> ducklingSlots = Sets.intersection(ducklingParameters, availableParametersSet);
+                for (Parameter d : ducklingSlots) {
+                    // Only time supported for now.
+                    String intentName = "action_map_slots_time_" + d.getId();
+                    fileContent.append("\t- " + intentName)
+                        .append("\n");
+                    ducklingSlotsMappingActions.add(intentName);
+                }
+
+                // All slots filled, send to server.
+                fileContent.append("\t- action_send_server_")
+                    .append(intent.getId())
+                    .append("\n\n");
+            }
+        }
+        return fileContent.toString();
+    }
+
     private static Map<String, ? super Object> createDomain(Indie parsedIndie) {
         Map<String, ? super Object> yamlContent = new HashMap<>();
 
@@ -280,12 +343,16 @@ public class EchoRasaPublisher {
         List<String> entities = slotsSet.stream()
             .map(Part::getAlias)
             .collect(Collectors.toList());
+        // Adds duckling custom entities.
+        entities.add("time");
+
         yamlContent.put("entities", entities);
 
         // Actions.
         List<String> actions = baseIntents.stream()
             .map("action_send_server_"::concat)
             .collect(Collectors.toList());
+        actions.addAll(ducklingSlotsMappingActions);
         yamlContent.put("actions", actions);
 
         // Slots.
@@ -296,12 +363,17 @@ public class EchoRasaPublisher {
             // Check if the type is native or custom.
             String slotType = nativeParameterMap.get(p.getEntityType());
             if (slotType == null) {
-                // Custom type just mapped to text.
+                // Custom types are mapped to text.
                 slotType = "text";
             }
             slot.put("type", slotType);
             slots.put(p.getAlias(), slot);
         }
+
+        // Adds duckling custom slots.
+        Map<String, String> timeSlot = Collections.singletonMap("type", "unfeaturized");
+        slots.put("time", timeSlot);
+
         yamlContent.put("slots", slots);
 
         // Responses
@@ -342,7 +414,7 @@ public class EchoRasaPublisher {
         for (Utterance u : intent.getFollowupUtterances()) {
             String intentId = "inform_" + intent.getId();
             CommonExample example = utterancePartsToCommonExample(u.getParts(), intentId);
-            informIntents.add(intentId);
+            informIntents.add(example.getIntent());
             examples.add(example);
         }
 
@@ -352,7 +424,6 @@ public class EchoRasaPublisher {
 
     private static CommonExample utterancePartsToCommonExample(List<Part> utteranceParts, String intentName) {
         CommonExample example = new CommonExample();
-        example.setIntent(intentName);
         String text = "";
 
         // Joins all the parts.
@@ -378,7 +449,8 @@ public class EchoRasaPublisher {
             }
         }
         example.setText(text);
+        example.setIntent(intentName);
         return example;
     }
-
+    
 }
